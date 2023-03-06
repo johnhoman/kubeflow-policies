@@ -1,0 +1,178 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: "kyverno:tracking-server-authorization"
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/instance: kyverno
+rules:
+- apiGroups:
+  - security.istio.io
+  resources:
+  - authorizationpolicies
+  verbs:
+  - create
+  - update
+  - delete
+  - patch
+  - list
+  - watch
+- apiGroups:
+  - networking.istio.io
+  resources:
+  - virtualservices
+  verbs:
+  - create
+  - update
+  - delete
+  - patch
+  - list
+  - watch
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: tracking-server-networking
+spec:
+  generateExistingOnPolicyUpdate: true
+  rules:
+  - name: network-namespace
+    match:
+      any:
+      - resources:
+          kinds:
+          - Namespace
+          selector:
+            matchLabels:
+              app.kubernetes.io/part-of: kubeflow-profile
+    generate:
+      synchronize: true
+      apiVersion: networking.istio.io/v1beta1
+      kind: VirtualService
+      name: 'mlflow-ingress-{{ request.object.metadata.name }}'
+      namespace: kubeflow
+      data:
+        spec:
+          gateways:
+          - kubeflow/kubeflow-gateway
+          hosts:
+          - '*'
+          http:
+          - match:
+            - uri:
+               prefix: "/tracking/{{ request.object.metadata.name }}/"
+            rewrite:
+              uri: /
+            headers:
+              request:
+                add:
+                  X-Kubernetes-Namespace: "{{ request.object.metadata.name }}"
+            route:
+            - destination:
+                host: mlflow-service.kubeflow.svc.cluster.local
+                port:
+                  number: 5000
+  - name: network-namespace-pods
+    match:
+      any:
+      - resources:
+          kinds:
+          - Namespace
+          selector:
+            matchLabels:
+              app.kubernetes.io/part-of: kubeflow-profile
+    generate:
+      synchronize: true
+      apiVersion: networking.istio.io/v1beta1
+      kind: VirtualService
+      name: mlflow-egress
+      namespace: '{{ request.object.metadata.name }}'
+      data:
+        spec:
+          hosts:
+          - mlflow-service.kubeflow.svc.cluster.local
+          http:
+          - match:
+            - uri:
+                prefix: /
+              sourceNamespace: "{{ request.object.metadata.name }}"
+            headers:
+              request:
+                add:
+                  X-Kubernetes-Namespace: "{{ request.object.metadata.name }}"
+            route:
+            - destination:
+                host: mlflow-service.kubeflow.svc.cluster.local
+                port:
+                  number: 5000
+  - name: authorization-policy-user
+    match:
+      any:
+      - resources:
+          kinds:
+          - rbac.authorization.k8s.io/v1/RoleBinding
+          namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: kubeflow-profile
+    preconditions:
+      all:
+      - key: '{{ request.object.metadata.annotations."user" }}'
+        operator: Equals
+        value: "*"
+      - key: '{{ request.object.metadata.annotations."role" }}'
+        operator: Equals
+        value: "*"
+    generate:
+      synchronize: true
+      apiVersion: security.istio.io/v1beta1
+      kind: AuthorizationPolicy
+      name: "mlflow-{{ request.object.metadata.namespace }}-{{ request.object.metadata.annotations.\"user\" | split(@, '@') | [0] }}"
+      namespace: kubeflow
+      data:
+        spec:
+          action: ALLOW
+          selector:
+            matchLabels:
+              app: mlflow-service
+          rules:
+          - when:
+            - key: request.headers[kubeflow-userid]
+              values: '{{ request.object.subjects[*].name }}'
+            - key: request.headers[x-kubernetes-namespace]
+              values:
+              - '{{ request.object.metadata.namespace }}'
+            from:
+            - source:
+                principals:
+                - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+  - name: authorization-policy-service-account
+    match:
+      any:
+      - resources:
+          kinds:
+          - Namespace
+          selector:
+            matchLabels:
+              app.kubernetes.io/part-of: kubeflow-profile
+    generate:
+      synchronize: true
+      apiVersion: security.istio.io/v1beta1
+      kind: AuthorizationPolicy
+      name: "mlflow-{{ request.object.metadata.name }}"
+      namespace: kubeflow
+      data:
+        spec:
+          action: ALLOW
+          selector:
+            matchLabels:
+              app: mlflow-service
+          rules:
+          - when:
+            - key: request.headers[x-kubernetes-namespace]
+              values:
+              - '{{ request.object.metadata.name }}'
+          - from:
+            - source:
+                principals:
+                - 'cluster.local/ns/{{ request.object.metadata.name }}/sa/*'

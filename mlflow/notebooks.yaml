@@ -1,0 +1,31 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: tracking-server-notebook-defaults
+spec:
+  generateExistingOnPolicyUpdate: true
+  schemaValidation: false
+  rules:
+  - name: set-experiment-id
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          selector:
+            matchExpressions:
+            - {key: notebook-name, operator: Exists}
+          namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: kubeflow-profile
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - name: '{{request.object.metadata.labels."notebook-name"}}'
+            env:
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: '{{request.object.metadata.labels."notebook-name"}}'
+            - name: MLFLOW_TRACKING_URI
+              value: 'http://mlflow-service.kubeflow.svc.cluster.local:5000'

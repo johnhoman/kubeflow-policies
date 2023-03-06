@@ -1,0 +1,187 @@
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: mlflow-filter
+  namespace: kubeflow
+spec:
+  workloadSelector:
+    labels:
+      app: mlflow-service
+  configPatches:
+    # The first patch adds the lua filter to the listener/http connection manager
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        # apparently absence of match here matches on everything
+        listener:
+          portNumber: 5000
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: "envoy.filters.http.router"
+      patch:
+        operation: INSERT_BEFORE
+        value: # lua filter specification
+          name: envoy.filters.http.lua
+          typed_config:
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+            inlineCode: |
+              url  = (loadfile "/tmp/lib/lua/url.lua")()
+              json = (loadfile "/tmp/lib/lua/JSON.lua")()
+              
+              function rewrite_body(h, f)
+                if h:headers():get("content-type") ~= "application/json" then
+                  return
+                end
+                data = json:decode(tostring(h:body():getBytes(0, h:body():length())))
+                f(data)
+                h:body():setBytes(json:encode(data))
+                h:headers():replace("content-length", h:body():length())
+              end
+              
+              function envoy_on_request(req)
+                u = url.parse(req:headers():get(":path"))
+                path = u.path
+                if path:sub(1, string.len("/api")) == "/api" then
+                  path = path:sub(string.len("/api/2.0/mlflow")+1, path:len())
+                  req:logCritical("api-path: "..path)
+                elseif path:sub(1, string.len("/ajax-api")) == "/ajax-api" then
+                  path = path:sub(string.len("/ajax-api/2.0/mlflow")+1, path:len())
+                  req:logCritical("ajax-path: "..path)
+                else
+                  req:logCritical("static-path: "..path)
+                  return
+                end
+              
+                method = req:headers():get(":method")
+                namespace = req:headers():get("x-kubernetes-namespace")
+                req:logCritical("namespace: "..namespace)
+                req:streamInfo():dynamicMetadata():set("envoy.filters.http.lua", ":path", path)
+                req:streamInfo():dynamicMetadata():set("envoy.filters.http.lua", ":namespace", namespace)
+                req:logCritical("path: "..path)
+              
+                if path == "/experiments/search" and method == "GET" then
+                  f = string.format("tags.namespace = '%s'", namespace)
+                  if u.query.filter ~= nil then
+                    u.query.filter = u.query.filter.." AND "..f
+                  else 
+                    u.query.filter = f
+                  end
+                  req:logCritical("experiments-search-path: "..tostring(u:normalize()))
+                  req:headers():replace(":path",tostring(u:normalize()))
+                end
+              
+                if path == "/experiments/create" and method == "POST" then
+                  rewrite_body(req, function(data)
+                    data["name"] = namespace.."-"..data["name"]
+                    if data["tags"] == nil then
+                      data["tags"] = {}
+                    end
+                    table.insert(data["tags"], { key = "namespace", value = namespace })
+                  end)
+                end
+              
+                if path == "/experiments/get-by-name" and method == "GET" then
+                  name = u.query["experiment_name"]
+                  u.query["experiment_name"] = namespace.."-"..name
+                  req:headers():replace(":path", tostring(u:normalize()))
+                end
+              
+                if path == "/experiments/update" and method == "POST" then
+                  rewrite_body(req, function(data)
+                    data["new_name"] = namespace.."-"..data["name"]
+                  end)
+                end
+                
+                if path == "/runs/create" and method == "POST" then
+                  rewrite_body(req, function(data)
+                    if data["tags"] == nil then
+                      data["tags"] = {}
+                    end
+                    table.insert(data["tags"], { key = "namespace", value = namespace })
+                  end)
+                end
+
+                if path == "/runs/log-batch" and method == "POST" then
+                  rewrite_body(req, function(data)
+                    if data["tags"] == nil then
+                      data["tags"] = {}
+                    end
+                    table.insert(data["tags"], { key = "namespace", value = namespace })
+                  end)
+                end
+              end
+              
+              function remove_namespace_tags(tags)
+                if tags == nil then
+                  return tags
+                end
+                out = {}
+                for k, tag in pairs(tags) do
+                  if tag.key ~= "namespace" then
+                    table.insert(out, tag)
+                  end
+                end
+                return out
+              end
+              
+              function normalize_experiment(exp, namespace)
+                exp.name = exp.name:sub(namespace:len()+2,exp.name:len())
+                exp.tags = remove_namespace_tags(exp.tags)
+                return exp
+              end
+              
+              function normalize_run(run, namespace)
+                run.data.tags = remove_namespace_tags(run.data.tags)
+                return run
+              end
+              
+              function envoy_on_response(res)
+                req_data = res:streamInfo():dynamicMetadata():get("envoy.filters.http.lua")
+                if req_data == nil or req_data[":path"] == nil then
+                  return
+                end
+                path = req_data[":path"]
+                namespace = req_data[":namespace"]
+                res:logCritical("response path: "..path)
+                res:logCritical("response namespace: "..namespace)
+              
+                if path == "/experiments/search" then
+                  rewrite_body(res, function(data)
+                    if data.experiments == nil then
+                      return
+                    end
+                    for k, exp in pairs(data.experiments) do
+                      data.experiments[k] = normalize_experiment(exp, namespace)
+                    end
+                  end)
+                end
+ 
+                if path == "/experiments/get" or path == "/experiments/get-by-name" then
+                  rewrite_body(res, function(data)
+                    if data.experiment == nil then
+                      return
+                    end
+                    data.experiment = normalize_experiment(data.experiment, namespace)
+                  end)
+                end
+              
+                if path == "/runs/search" then
+                  rewrite_body(res, function(data)
+                    if data.runs == nil then
+                      return
+                    end
+                    for k, run in pairs(data.runs) do
+                      data.runs[k] = normalize_run(run, namespace)
+                    end
+                  end)
+                end
+              
+                if path == "/runs/get" or path == "/runs/create" then
+                  rewrite_body(res, function(data)
+                      data.run = normalize_run(data.run, namespace)
+                  end)
+                end
+              end
